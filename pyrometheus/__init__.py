@@ -338,8 +338,8 @@ code_tpl = Template(
     """\"""
 .. autoclass:: Thermochemistry
 \"""
-
-
+import operator as op
+from functools import partial
 import numpy as np
 
 
@@ -382,6 +382,15 @@ def _pyro_norm(usr_np, argument, normord):
 def _pyro_zeros_like(argument):
     # FIXME: This is imperfect, as a NaN will stay a NaN.
     return 0 * argument
+
+
+def _with_rev_broadcast(op, operand1, operand2):
+    return op(operand1.T, operand2.T).T
+	
+_rev_mul = partial(_with_rev_broadcast, op.mul)
+
+
+
 
 
 class Thermochemistry:
@@ -484,8 +493,8 @@ class Thermochemistry:
     def get_mix_molecular_weight(self, mass_fractions):
         return 1/np.dot(self.iwts, mass_fractions)
 
-    def get_concentrations(self, rho, mass_fractions):
-        concs = self.iwts * rho * mass_fractions
+    def get_concentrations(self, rho, mass_fractions):        
+        concs = self.iwts*_rev_mul(rho, mass_fractions)
         zero = _pyro_zeros_like(concs[0])
         for i, conc in enumerate(concs):
             concs[i] = self.usr_np.where(concs[i] < 0, zero, concs[i])
@@ -595,12 +604,14 @@ class Thermochemistry:
         %endfor
                 ])
 
+        # print("checkpoint 1")
         reduced_pressure = _pyro_make_array([
         %for i, react in enumerate(falloff_reactions):
             (${cgm(third_body_efficiencies_expr(
                 sol, react, Variable("concentrations")))})*k_low[${i}]/k_high[${i}],
         %endfor
                             ])
+        # print("checkpoint 2")
 
         falloff_center = _pyro_make_array([
         %for react in falloff_reactions:
