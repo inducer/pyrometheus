@@ -27,8 +27,12 @@ import sys
 
 import cantera as ct
 import numpy as np  # noqa: F401
+import jax
+import jax.numpy as jnp  # noqa: F401
 import pyrometheus as pyro
 import pytest
+
+jax.config.update("jax_enable_x64", 1)
 
 
 # Write out all the mechanisms for inspection
@@ -42,12 +46,13 @@ def test_generate_mechfile(mechname):
 
 
 @pytest.mark.parametrize("mechname", ["uiuc", "sanDiego"])
-def test_get_rate_coefficients(mechname):
+@pytest.mark.parametrize("np_instance", [np, jnp])
+def test_get_rate_coefficients(mechname, np_instance):
     """This function tests that pyrometheus-generated code
     computes the rate coefficients matching Cantera
     for given temperature and composition"""
     sol = ct.Solution(f"mechs/{mechname}.cti", "gas")
-    ptk = pyro.get_thermochem_class(sol)()
+    ptk = pyro.get_thermochem_class(sol)(usr_np=np_instance)
     # Test temperatures
     temp = np.linspace(500.0, 3000.0, 10)
     for t in temp:
@@ -67,14 +72,15 @@ def test_get_rate_coefficients(mechname):
 
 
 @pytest.mark.parametrize("mechname", ["uiuc", "sanDiego"])
-def test_get_pressure(mechname):
+@pytest.mark.parametrize("np_instance", [np, jnp])
+def test_get_pressure(mechname, np_instance):
     """This function tests that pyrometheus-generated code
     computes the Cantera-predicted pressure for given density,
     temperature, and mass fractions
     """
     # Create Cantera and pyrometheus objects
     sol = ct.Solution(f"mechs/{mechname}.cti", "gas")
-    ptk = pyro.get_thermochem_class(sol)()
+    ptk = pyro.get_thermochem_class(sol)(usr_np=np_instance)
 
     # Temperature, equivalence ratio, oxidizer ratio, stoichiometry ratio
     t = 300.0
@@ -103,13 +109,14 @@ def test_get_pressure(mechname):
 
 
 @pytest.mark.parametrize("mechname", ["uiuc", "sanDiego"])
-def test_get_thermo_properties(mechname):
+@pytest.mark.parametrize("np_instance", [np, jnp])
+def test_get_thermo_properties(mechname, np_instance):
     """This function tests that pyrometheus-generated code
     computes thermodynamic properties c_p, s_r, h_rt, and k_eq
     correctly by comparing against Cantera"""
     # Create Cantera and pyrometheus objects
     sol = ct.Solution(f"mechs/{mechname}.cti", "gas")
-    ptk = pyro.get_thermochem_class(sol)()
+    ptk = pyro.get_thermochem_class(sol)(usr_np=np_instance)
 
     # Loop over temperatures
     temp = np.linspace(500.0, 3000.0, 10)
@@ -160,13 +167,14 @@ def test_get_thermo_properties(mechname):
 
 
 @pytest.mark.parametrize("mechname", ["uiuc", "sanDiego"])
-def test_get_temperature(mechname):
+@pytest.mark.parametrize("np_instance", [np, jnp])
+def test_get_temperature(mechname, np_instance):
     """This function tests that pyrometheus-generated code
     computes the Cantera-predicted temperature for given internal energy
     and mass fractions"""
     # Create Cantera and pyrometheus objects
     sol = ct.Solution(f"mechs/{mechname}.cti", "gas")
-    ptk = pyro.get_thermochem_class(sol)()
+    ptk = pyro.get_thermochem_class(sol)(usr_np=np_instance)
     tol = 1.0e-10
     # Test temperatures
     temp = np.linspace(500.0, 3000.0, 10)
@@ -197,12 +205,13 @@ def test_get_temperature(mechname):
 @pytest.mark.parametrize("mechname, fuel, stoich_ratio, dt",
                          [("uiuc", "C2H4", 3.0, 1e-7),
                           ("sanDiego", "H2", 0.5, 1e-6)])
-def test_kinetics(mechname, fuel, stoich_ratio, dt):
+@pytest.mark.parametrize("np_instance", [np, jnp])
+def test_kinetics(mechname, fuel, stoich_ratio, dt, np_instance):
     """This function tests that pyrometheus-generated code
     computes the Cantera-predicted rates of progress for given
     temperature and composition"""
     sol = ct.Solution(f"mechs/{mechname}.cti", "gas")
-    ptk = pyro.get_thermochem_class(sol)()
+    ptk = pyro.get_thermochem_class(sol)(usr_np=np_instance)
 
     # Homogeneous reactor to get test data
     init_temperature = 1500.0
@@ -259,6 +268,74 @@ def test_kinetics(mechname, fuel, stoich_ratio, dt):
         assert err_omega < 1.0e-10
 
     return
+
+
+def test_autodiff_accuracy():
+    sol = ct.Solution("mechs/sanDiego.cti", "gas")
+    ptk = pyro.get_thermochem_class(sol)(usr_np=jnp)
+
+    # mass ratios
+    equiv_ratio = 1.0
+    ox_di_ratio = 0.21
+    stoich_ratio = 0.5
+    # indices
+    i_fu = ptk.species_index("H2")
+    i_ox = ptk.species_index("O2")
+    i_di = ptk.species_index("N2")
+    # mole fractions
+    x = np.zeros(ptk.num_species)
+    x[i_fu] = (ox_di_ratio*equiv_ratio)/(stoich_ratio+ox_di_ratio*equiv_ratio)
+    x[i_ox] = stoich_ratio*x[i_fu]/equiv_ratio
+    x[i_di] = (1.0-ox_di_ratio)*x[i_ox]/ox_di_ratio
+    # mass fractions
+    y = x * ptk.wts / sum(x*ptk.wts)
+    # energy
+    temperature = 1500
+    enthalpy = ptk.get_mixture_enthalpy_mass(temperature, y)
+
+    # get equilibrium temperature
+    sol.TPX = temperature, ct.one_atm, x
+    y = sol.Y
+
+    mass_fractions = jnp.array(y)
+
+    guess_temp = 1400
+
+    def chemical_source_term(mass_fractions):
+        temperature = ptk.get_temperature(enthalpy, guess_temp, mass_fractions)
+        density = ptk.get_density(ptk.one_atm, temperature, mass_fractions)
+        return ptk.get_net_production_rates(density, temperature, mass_fractions)
+
+    from jax import jacfwd
+    chemical_jacobian = jacfwd(chemical_source_term)
+
+    def jacobian_fd_approx(mass_fractions, delta_y):
+
+        # Second-order (central) difference
+        return jnp.array([
+            (chemical_source_term(mass_fractions+delta_y*v)
+                    - chemical_source_term(mass_fractions-delta_y*v))/(2*delta_y)
+            for v in jnp.eye(len(mass_fractions))
+        ]).T
+
+    j = chemical_jacobian(mass_fractions)
+
+    deltas = np.array([1e-5, 1e-6, 1e-7])
+    err = np.zeros(len(deltas))
+    from pytools.convergence import EOCRecorder
+    eocrec = EOCRecorder()
+    for i, delta_y in enumerate(deltas):
+        j_fd = jacobian_fd_approx(mass_fractions, delta_y)
+        # Lapack norm (Anderson)
+        err[i] = np.linalg.norm(j-j_fd, "fro")/np.linalg.norm(j, "fro")
+        eocrec.add_data_point(delta_y, err[i])
+
+    print("------------------------------------------------------")
+    print("expected order: 2")
+    print("------------------------------------------------------")
+    print(eocrec.pretty_print())
+    orderest = eocrec.estimate_order_of_convergence()[0, 1]
+    assert orderest > 1.95
 
 
 @pytest.mark.parametrize("mechname, fuel, stoich_ratio",
